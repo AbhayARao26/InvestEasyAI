@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 from dotenv import load_dotenv
@@ -10,9 +10,31 @@ import google.generativeai as genai
 from newsapi import NewsApiClient
 import mysql.connector
 from mysql.connector import Error
+import bcrypt
+import jwt
 
 # Load environment variables
 load_dotenv()
+
+# JWT configuration
+JWT_SECRET = os.getenv('JWT_SECRET', 'your-secret-key')  # Add this to your .env file
+JWT_ALGORITHM = 'HS256'
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=1)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.JWTError:
+        return None
 
 # Configure Gemini
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -69,38 +91,83 @@ if 'portfolio_last_updated' not in st.session_state:
 
 def login(username, password):
     try:
-        response = requests.post(
-            f"{BACKEND_URL}/token",
-            data={"username": username, "password": password}
-        )
-        if response.status_code == 200:
-            st.session_state.token = response.json()["access_token"]
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        
+        # Get user from database
+        cursor.execute("""
+            SELECT id, username, hashed_password 
+            FROM users 
+            WHERE username = %s
+        """, (username,))
+        
+        user = cursor.fetchone()
+        
+        if user and bcrypt.checkpw(password.encode('utf-8'), user['hashed_password'].encode('utf-8')):
+            # Create token for the user
+            token = create_access_token(data={"sub": username})
+            st.session_state.token = token
             st.session_state.user = username
             return True
         return False
     except Exception as e:
         st.error(f"Error during login: {str(e)}")
         return False
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
 
 def register(username, email, password, investor_type):
     try:
-        response = requests.post(
-            f"{BACKEND_URL}/register",
-            json={
-                "username": username,
-                "email": email,
-                "password": password,
-                "investor_type": investor_type
-            }
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        
+        # Check if username already exists
+        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+        if cursor.fetchone():
+            return False, "Username already exists"
+        
+        # Check if email already exists
+        cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
+        if cursor.fetchone():
+            return False, "Email already exists"
+        
+        # Hash the password
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+        
+        # Insert new user - using hashed_password instead of password
+        cursor.execute(
+            """
+            INSERT INTO users (username, email, hashed_password, investor_type)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (username, email, hashed_password.decode('utf-8'), investor_type)
         )
-        if response.status_code == 200:
-            st.session_state.token = response.json()["access_token"]
+        
+        conn.commit()
+        
+        # Get the new user's ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+        
+        if user:
+            # Create a token for the new user
+            token = create_access_token(data={"sub": username})
+            st.session_state.token = token
             st.session_state.user = username
-            return True
-        return False
+            return True, "Registration successful"
+        else:
+            return False, "Failed to create user"
+            
     except Exception as e:
-        st.error(f"Error during registration: {str(e)}")
-        return False
+        return False, str(e)
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
 
 def check_api_limit():
     current_date = datetime.now().date()
@@ -221,6 +288,11 @@ def get_ai_response(user_input):
 
 def get_user_portfolio(username, force_refresh=False):
     try:
+        # Security check - verify the requested username matches the logged-in user
+        if username != st.session_state.user:
+            st.error("Unauthorized access attempt")
+            return []
+
         # Check if we can use cached data
         current_time = datetime.now()
         if (not force_refresh and 
@@ -234,13 +306,20 @@ def get_user_portfolio(username, force_refresh=False):
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True)
         
-        # Get user's portfolio with current market prices
+        # First get the user's ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+        if not user:
+            st.error("User not found")
+            return []
+        
+        # Get user's portfolio with current market prices using user_id
         cursor.execute("""
             SELECT p.*, u.username 
             FROM portfolio p 
             JOIN users u ON p.user_id = u.id 
-            WHERE u.username = %s
-        """, (username,))
+            WHERE p.user_id = %s
+        """, (user['id'],))
         
         portfolio = cursor.fetchall()
         
@@ -288,6 +367,10 @@ def get_user_portfolio(username, force_refresh=False):
 
 def add_stock_to_portfolio(username, stock_symbol, quantity, avg_price):
     try:
+        # Security check - verify the requested username matches the logged-in user
+        if username != st.session_state.user:
+            return False, "Unauthorized access attempt"
+
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True)
         
@@ -334,8 +417,78 @@ def add_stock_to_portfolio(username, stock_symbol, quantity, avg_price):
     except Exception as e:
         return False, str(e)
     finally:
-        cursor.close()
-        conn.close()
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
+
+def get_user_financial_goals(username):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        
+        # Get user ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+        if not user:
+            return None
+        
+        # Get financial goals
+        cursor.execute("""
+            SELECT * FROM financial_goals 
+            WHERE user_id = %s 
+            ORDER BY created_at DESC 
+            LIMIT 1
+        """, (user['id'],))
+        
+        return cursor.fetchone()
+    except Exception as e:
+        st.error(f"Error fetching financial goals: {str(e)}")
+        return None
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
+
+def update_financial_goals(username, investment_amount, target_return, time_period, risk_tolerance):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        
+        # Get user ID
+        cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+        if not user:
+            return False, "User not found"
+        
+        # Check if goals exist
+        cursor.execute("SELECT id FROM financial_goals WHERE user_id = %s", (user['id'],))
+        existing_goals = cursor.fetchone()
+        
+        if existing_goals:
+            # Update existing goals
+            cursor.execute("""
+                UPDATE financial_goals 
+                SET investment_amount = %s, target_return = %s, time_period = %s, risk_tolerance = %s, created_at = CURRENT_TIMESTAMP
+                WHERE user_id = %s
+            """, (investment_amount, target_return, time_period, risk_tolerance, user['id']))
+        else:
+            # Insert new goals
+            cursor.execute("""
+                INSERT INTO financial_goals (user_id, investment_amount, target_return, time_period, risk_tolerance)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (user['id'], investment_amount, target_return, time_period, risk_tolerance))
+        
+        conn.commit()
+        return True, "Financial goals updated successfully"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
 
 def main():
     st.set_page_config(
@@ -380,13 +533,21 @@ def main():
             new_username = st.text_input("New Username", key="reg_username")
             new_email = st.text_input("Email", key="reg_email")
             new_password = st.text_input("New Password", type="password", key="reg_password")
+            confirm_password = st.text_input("Confirm Password", type="password", key="confirm_password")
             investor_type = st.selectbox("Investor Type", ["beginner", "amateur"])
+            
             if st.button("Register"):
-                if register(new_username, new_email, new_password, investor_type):
-                    st.success("Registration successful!")
-                    st.rerun()
+                if not new_username or not new_email or not new_password:
+                    st.error("Please fill in all fields")
+                elif new_password != confirm_password:
+                    st.error("Passwords do not match")
                 else:
-                    st.error("Registration failed")
+                    success, message = register(new_username, new_email, new_password, investor_type)
+                    if success:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
 
     else:
         # Main Dashboard
@@ -398,7 +559,7 @@ def main():
         # Navigation
         page = st.sidebar.radio(
             "Navigation",
-            ["Dashboard", "Portfolio", "News & Alerts", "Chat", "Settings"]
+            ["Dashboard", "Portfolio", "Financial Goals", "News & Alerts", "Chat", "Settings"]
         )
 
         if page == "Dashboard":
@@ -498,6 +659,95 @@ def main():
             else:
                 st.info("Your portfolio is empty. Add some stocks to get started!")
 
+        elif page == "Financial Goals":
+            st.header("Financial Goals")
+            
+            # Get current financial goals
+            current_goals = get_user_financial_goals(st.session_state.user)
+            
+            if current_goals:
+                st.subheader("Current Financial Goals")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Investment Amount", f"${current_goals['investment_amount']:,.2f}")
+                with col2:
+                    st.metric("Target Return", f"{current_goals['target_return']}%")
+                with col3:
+                    st.metric("Time Period", f"{current_goals['time_period']} years")
+                with col4:
+                    risk_value = float(current_goals['risk_tolerance'])
+                    risk_label = "Conservative" if risk_value < 0.33 else "Moderate" if risk_value < 0.66 else "Aggressive"
+                    st.metric("Risk Tolerance", risk_label)
+                
+                st.write(f"Last Updated: {current_goals['created_at'].strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                st.info("Financial goals have not been set yet.")
+            
+            # Update Financial Goals Form
+            st.subheader("Update Financial Goals")
+            with st.form("financial_goals_form"):
+                # Convert decimal values to float for the form
+                current_investment = float(current_goals['investment_amount']) if current_goals else 0.0
+                current_return = float(current_goals['target_return']) if current_goals else 0.0
+                current_period = int(current_goals['time_period']) if current_goals else 1
+                current_risk = float(current_goals['risk_tolerance']) if current_goals else 0.5
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    investment_amount = st.number_input(
+                        "Investment Amount ($)",
+                        min_value=0.0,
+                        value=current_investment,
+                        step=1000.0,
+                        format="%.2f"
+                    )
+                    target_return = st.number_input(
+                        "Target Return (%)",
+                        min_value=0.0,
+                        value=current_return,
+                        step=1.0,
+                        format="%.2f"
+                    )
+                with col2:
+                    time_period = st.number_input(
+                        "Time Period (years)",
+                        min_value=1,
+                        value=current_period,
+                        step=1
+                    )
+                    risk_tolerance = st.slider(
+                        "Risk Tolerance",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=current_risk,
+                        step=0.01,
+                        format="%.2f",
+                        help="0 = Conservative, 1 = Aggressive"
+                    )
+                
+                # Risk tolerance explanation
+                risk_value = risk_tolerance
+                risk_label = "Conservative" if risk_value < 0.33 else "Moderate" if risk_value < 0.66 else "Aggressive"
+                st.info(f"Selected Risk Level: {risk_label}")
+                
+                submitted = st.form_submit_button("Update Goals")
+                if submitted:
+                    if investment_amount <= 0 or target_return <= 0 or time_period <= 0:
+                        st.error("Please enter valid values for all fields")
+                    else:
+                        success, message = update_financial_goals(
+                            st.session_state.user,
+                            float(investment_amount),
+                            float(target_return),
+                            int(time_period),
+                            float(risk_tolerance)
+                        )
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+
         elif page == "News & Alerts":
             st.header("News & Alerts")
             
@@ -560,3 +810,4 @@ def main():
 
 if __name__ == "__main__":
     main() 
+

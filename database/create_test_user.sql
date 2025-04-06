@@ -1,4 +1,4 @@
-INSERT INTO users (username, email, password_hash, investor_type) 
+INSERT INTO users (username, email, hashed_password, investor_type) 
 VALUES (
     'testuser', 
     'test@example.com', 
