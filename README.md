@@ -52,11 +52,10 @@ InvestEasy is a comprehensive financial assistant platform that helps users make
 investeasy/
 ├── app.py                 # Main Streamlit application
 ├── backend/              # FastAPI backend
-│   ├── main.py
-│   ├── auth.py
-│   └── models.py
+│   └── main.py
 ├── database/            # Database scripts
-│   └── schema.sql
+│   ├── schema.sql
+│   └── create_test_user.sql
 ├── models/             # AI models and utilities
 │   ├── chatbot.py
 │   └── sentiment.py
